@@ -100,13 +100,17 @@ def cargar_y_preparar_datos(ruta_archivo):
             'Importe Primeros Pedidos', 'Importe Recurrentes',
             'Tiempo Medio Recurrencia (Días)'
         ]]
+    
+    # generar la tabla desglosada por Año-Mes
+    # convertimos el Period a String para que los gráficos no den problemas
+    df_pedidos['anyo_mes_str'] = df_pedidos['anyo_mes_adquisicion'].astype(str)
 
     tabla_anyo_mes = crear_tabla_kpis(df_pedidos, 'anyo_mes_str')
     tabla_estado = crear_tabla_kpis(df_pedidos, 'state').sort_values('Clientes Adquiridos', ascending=False)
     
     return tabla_anyo_mes, tabla_estado
 
-tabla_anyo_mes, tabla_estado = cargar_y_preparar_datos('dataset.json')
+tabla_anyo_mes, tabla_estado = cargar_y_preparar_datos('dataset.zip')
 
 st.divider()
 

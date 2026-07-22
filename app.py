@@ -4,6 +4,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.express as px
+import zipfile
 
 st.set_page_config(page_title="Cuadro de Mandos - Ventas", layout="wide")
 
@@ -13,57 +14,103 @@ st.markdown("Análisis de recurrencia, ingresos por año-mes y distribución geo
 @st.cache_data
 def cargar_y_preparar_datos(ruta_archivo):
     datos_crudos = []
-    with open(ruta_archivo, 'r', encoding='utf-8') as archivo:
-        for linea in archivo:
-            datos_crudos.append(json.loads(linea))
+    with zipfile.ZipFile(ruta_archivo, 'r') as z:
+        with z.open('dataset.json') as f:
+            for linea in f:
+                datos_crudos.append(json.loads(linea.decode('utf-8')))
             
     df = pd.json_normalize(datos_crudos, record_path='order_items', 
                            meta=['order_id', 'order_date', 'first_name', 'last_name', 
                                  'gender', 'email', 'phone', 'state', 'zip'])
     
-    # Parseo
+    # convertir las columnas de texto a numéricas
     df['price'] = pd.to_numeric(df['price'])
     df['qty_ordered'] = pd.to_numeric(df['qty_ordered'])
     df['discount_amount'] = pd.to_numeric(df['discount_amount'])
+
+    # convertir la columna de fecha a tipo datetime (formato Día-Mes-Año)
     df['order_date'] = pd.to_datetime(df['order_date'], format='%d-%m-%Y')
-    df['total_linea'] = (df['price'] * df['qty_ordered']) - df['discount_amount']
+
+    # columna de ventas totales por línea
+    df['total'] = (df['price'] * df['qty_ordered']) - df['discount_amount']
     
-    # Eliminar duplicados (asumiendo Opción A)
-    df = df.drop_duplicates()
+    # rellenamos con ceros a la izquierda hasta tener 5 dígitos
+    df['zip'] = df['zip'].astype(str).str.zfill(5)
+
+    # columnas que identifican unívocamente una línea "única"
+    columnas_identificadoras = [
+        'order_id', 'order_date', 'first_name', 'last_name',
+        'gender', 'email', 'phone', 'state', 'zip',
+        'sku', 'product_category', 'price'
+    ]
+
+    # agrupamos por esas columnas y sumamos las cantidades y totales
+    df = df.groupby(columnas_identificadoras, as_index=False).agg({
+        'qty_ordered': 'sum',
+        'discount_amount': 'sum',
+        'total': 'sum'
+    })
     
-    # --- FASE 3: Agrupación por pedidos y clientes ---
-    df_pedidos = df.groupby(['order_id', 'order_date', 'email', 'state'], as_index=False)['total_linea'].sum().rename(columns={'total_linea': 'importe_pedido'})
+    # agrupar a nivel de pedido
+    # Sumamos el totalpara saber el importe total de cada pedido
+    df_pedidos = df.groupby(
+        ['order_id', 'order_date', 'email', 'state'], as_index=False
+    )['total'].sum().rename(columns={'total': 'importe_pedido'})
+
+    # ordenar cronológicamente por cliente y fecha
     df_pedidos = df_pedidos.sort_values(['email', 'order_date'])
+
+    # número de pedido de cada cliente (1 = el primero, 2 = el segundo...)
     df_pedidos['num_pedido'] = df_pedidos.groupby('email').cumcount() + 1
-    df_pedidos['tipo_pedido'] = np.where(df_pedidos['num_pedido'] == 1, 'Primer Pedido', 'Recurrente')
-    df_pedidos['fecha_adquisicion'] = df_pedidos.groupby('email')['order_date'].transform('min')
-    df_pedidos['cohorte_adquisicion'] = df_pedidos['fecha_adquisicion'].dt.to_period('M').astype(str)
+
+    # etiquetar si es "Primer Pedido" o "Recurrente"
+    df_pedidos['tipo_pedido'] = np.where(
+        df_pedidos['num_pedido'] == 1, 'Primer Pedido', 'Recurrente'
+    )
+
+    # año y mes de adquisición
+    # buscamos la fecha del primer pedido de cada cliente
+    df_pedidos['fecha_primera_compra'] = df_pedidos.groupby('email')['order_date'].transform('min')
+    # extraemos el Año-Mes
+    df_pedidos['anyo_mes_adquisicion'] = df_pedidos['fecha_primera_compra'].dt.to_period('M')
+
+    # tiempo entre recurrencias
     df_pedidos['dias_desde_anterior'] = df_pedidos.groupby('email')['order_date'].diff().dt.days
     
-    # --- FASE 4: Funciones de resumen ---
-    def crear_tabla_kpis(df_agrupado, dimension):
-        resumen = df_agrupado.groupby(dimension).apply(lambda x: pd.Series({
+    # función para generar la tabla resumen de KPIs
+    def crear_tabla_kpis(df, dimension):
+        # agrupamos por la dimensión y calculamos métricas
+        resumen = df.groupby(dimension).apply(lambda x: pd.Series({
             'Clientes Adquiridos': x['email'].nunique(),
             'Clientes Recurrentes': x[x['tipo_pedido'] == 'Recurrente']['email'].nunique(),
             'Importe Primeros Pedidos': x[x['tipo_pedido'] == 'Primer Pedido']['importe_pedido'].sum(),
             'Importe Recurrentes': x[x['tipo_pedido'] == 'Recurrente']['importe_pedido'].sum(),
             'Tiempo Medio Recurrencia (Días)': x['dias_desde_anterior'].mean()
         }))
-        resumen['% Recurrentes'] = (resumen['Clientes Recurrentes'] / resumen['Clientes Adquiridos'] * 100)
-        resumen = resumen.fillna(0).round(2)
-        return resumen[['Clientes Adquiridos', '% Recurrentes', 'Importe Primeros Pedidos', 'Importe Recurrentes', 'Tiempo Medio Recurrencia (Días)']]
 
-    tabla_anyo_mes = crear_tabla_kpis(df_pedidos, 'cohorte_adquisicion')
+        # calcular el % de recurrencia y formatear
+        resumen['% Recurrentes'] = (resumen['Clientes Recurrentes'] / resumen['Clientes Adquiridos'] * 100)
+
+        # limpiar posibles valores nulos (ej. intervalos sin recurrentes)
+        resumen = resumen.fillna(0).round(2)
+
+        # reordenar columnas para mejor lectura
+        return resumen[[
+            'Clientes Adquiridos', '% Recurrentes',
+            'Importe Primeros Pedidos', 'Importe Recurrentes',
+            'Tiempo Medio Recurrencia (Días)'
+        ]]
+
+    tabla_anyo_mes = crear_tabla_kpis(df_pedidos, 'anyo_mes_str')
     tabla_estado = crear_tabla_kpis(df_pedidos, 'state').sort_values('Clientes Adquiridos', ascending=False)
     
     return tabla_anyo_mes, tabla_estado
 
-# Ejecutamos la función (Streamlit mostrará un loader de forma automática si tarda)
-tabla_anyo_mes, tabla_estado = cargar_y_preparar_datos('dataset.json') # Asegúrate del nombre correcto
+tabla_anyo_mes, tabla_estado = cargar_y_preparar_datos('dataset.json')
 
 st.divider()
 
-st.subheader("🗓️ Análisis por Cohorte Año-Mes")
+st.subheader("🗓️ Análisis por Año-Mes")
 
 fig_temporal, ax = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -88,7 +135,6 @@ if max(tabla_anyo_mes['% Recurrentes']) > 0:
 
 plt.tight_layout()
 
-# Renderizamos el gráfico en Streamlit
 st.pyplot(fig_temporal)
 
 st.markdown("##### Tabla por Año-Mes")

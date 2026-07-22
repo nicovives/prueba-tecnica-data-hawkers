@@ -4,3 +4,4 @@ matplotlib
 plotly
 json
 numpy
+zipfile
